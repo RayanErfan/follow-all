@@ -6,7 +6,7 @@ Made for the class assignment "follow everyone on the list".
 Uses only the Python standard library — no pip install needed.
 
 Usage:
-    python3 follow_all.py <profile-username> [--dry-run]
+    python3 follow_all.py <profile-username> [--dry-run] [-h]
 
 Authentication (never put your token inside the script!):
     - macOS/Linux:  export GITHUB_TOKEN=ghp_xxxxx
@@ -34,6 +34,7 @@ from getpass import getpass
 
 API = "https://api.github.com"
 HEADERS = {"Accept": "application/vnd.github+json", "User-Agent": "follow-all-script"}
+MAX_RETRIES = 5
 
 
 def fail(msg):
@@ -41,34 +42,42 @@ def fail(msg):
     sys.exit(1)
 
 
-def api(method, path, token=None, quiet_errors=()):
-    """Make one GitHub API request. Returns (status_code, parsed_json_or_None)."""
+def api(method, path, token=None):
+    """Make one GitHub API request. Returns (status_code, parsed_json_or_None).
+
+    A rate limit (HTTP 403 with the quota spent, or HTTP 429) is waited out and
+    the request is repeated, up to MAX_RETRIES times in total. If it is still
+    limited after that, the status code is returned like any other error.
+    """
     headers = dict(HEADERS)
     if token:
         headers["Authorization"] = f"Bearer {token}"
-    req = urllib.request.Request(API + path, method=method, headers=headers)
-    try:
-        with urllib.request.urlopen(req, timeout=30) as resp:
-            body = resp.read()
-            return resp.status, json.loads(body) if body else None
-    except urllib.error.HTTPError as e:
-        if e.code in quiet_errors:
-            return e.code, None
-        if e.code == 403 and e.headers.get("X-RateLimit-Remaining") == "0":
-            reset = int(e.headers.get("X-RateLimit-Reset", time.time() + 60))
-            wait = max(reset - time.time(), 5)
-            print(f"  rate limit hit, waiting {int(wait)}s ...")
-            time.sleep(wait)
-            return api(method, path, token, quiet_errors)
-        if e.code == 429:
-            print("  slow down, waiting 60s ...")
-            time.sleep(60)
-            return api(method, path, token, quiet_errors)
+    limited = None
+    for _ in range(MAX_RETRIES):
+        req = urllib.request.Request(API + path, method=method, headers=headers)
         try:
-            detail = json.loads(e.read()).get("message", "")
-        except Exception:
-            detail = ""
-        return e.code, {"message": detail}
+            with urllib.request.urlopen(req, timeout=30) as resp:
+                body = resp.read()
+                return resp.status, json.loads(body) if body else None
+        except urllib.error.HTTPError as e:
+            if e.code == 403 and e.headers.get("X-RateLimit-Remaining") == "0":
+                reset = int(e.headers.get("X-RateLimit-Reset", time.time() + 60))
+                wait = max(reset - time.time(), 5)
+                print(f"  rate limit hit, waiting {int(wait)}s ...")
+                time.sleep(wait)
+                limited = e.code
+                continue
+            if e.code == 429:
+                print("  slow down, waiting 60s ...")
+                time.sleep(60)
+                limited = e.code
+                continue
+            try:
+                detail = json.loads(e.read()).get("message", "")
+            except Exception:
+                detail = ""
+            return e.code, {"message": detail}
+    return limited, None
 
 
 def get_token():
@@ -101,8 +110,12 @@ def get_following(profile, token):
 
 def main():
     args = [a for a in sys.argv[1:] if not a.startswith("-")]
-    dry_run = "--dry-run" in sys.argv[1:]
+    flags = sys.argv[1:]
+    dry_run = "--dry-run" in flags
 
+    if "--help" in flags or "-h" in flags:
+        print(__doc__.strip())
+        return
     if len(args) != 1:
         print(__doc__.strip())
         sys.exit(1)
@@ -131,7 +144,7 @@ def main():
     ok = failed = 0
     failures = []
     for i, login in enumerate(unique, 1):
-        status, _ = api("PUT", f"/user/following/{login}", token, quiet_errors=(429,))
+        status, _ = api("PUT", f"/user/following/{login}", token)
         if status == 204:
             ok += 1
         else:
